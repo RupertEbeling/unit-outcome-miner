@@ -1,7 +1,9 @@
-from bs4 import BeautifulSoup
-import pandas as pd
-import os
 import json
+import os
+import re
+import pandas as pd
+from bs4 import BeautifulSoup
+
 """
 This is the file that extracts the statistics from SETU data (not provided). You may run this script by uncommenting the gen_database functions.
 The process to extract all SETU information can take a few minutes, so be patient! After this, they are serialized for convenient use later down the line.
@@ -9,17 +11,34 @@ Credits to Jake Vandenberg for the original script.
 """
 
 
-def mine_setu_html(filename: str, season: str) -> dict:
+def mine_setu_html(filename: str, season: str, **qwargs) -> dict:
     """
-    Creates a dictionary of units with their statistics.
+    Args:
+    -----
+        filename (str): Filepath to read from.
+        season (str): The season in which the unit was done.
 
-    :param filename: str filepath to read from.
-    :param save_filename: str filepath to write to.
-    :param sem: adds the semester and year in which the unit was done. e.g 2020_S1
-    :output: dictionary.
-
+    Optional Args:
+    --------------
+        results_as_dict (bool): Flag to return the results as a dictionary.  
+        Default is False indicators are given as a list.
+        include_labels (bool): Flag to include the indicators (labels). Default is False.
+        use_labels (bool): Flag to use the labels as the key instead of the indicator number. Default is False.
+        exclude_faculty_items: Flag to exclude faculty items. Default is False.
+    Returns:
+    --------
+        dict: DataFrame with the extracted data.
     """
 
+    results_as_dict = qwargs.get("results_as_dict", False) 
+    include_labels = qwargs.get("include_labels", False)
+    use_labels = qwargs.get("use_labels", False)
+    exclude_faculty_items = qwargs.get("exclude_faculty_items", False)
+    # [float, float, str] seems too weird, so enforcing this. Feel free to remove
+    if not results_as_dict and include_labels:
+        raise ValueError("include_labels can only be set to True if results_as_dict is True.")
+    
+    INDICATOR_PREFIX = "INDICATOR_"
     with open(filename, "r") as f:
         contents = f.read()
         soup = BeautifulSoup(contents, "lxml")
@@ -50,8 +69,8 @@ def mine_setu_html(filename: str, season: str) -> dict:
         entry["Response Rate"] = responded / invited * 100
 
         # Full unit code
-        code = article.find("table").find_all("tr")[3].text.replace("\n", "")
-        unit_name = article.find("table").find_all("tr")[4].text.replace("\n", "")
+        code = article.find("table").find_all("tr")[3].text.replace("\n", "").strip()
+        unit_name = article.find("table").find_all("tr")[4].text.replace("\n", "").strip()
 
         # Filter out MALAYSIA, COMPOSITE, ALFRED, SAFRICA
         if any(
@@ -70,25 +89,69 @@ def mine_setu_html(filename: str, season: str) -> dict:
             entry["Level"] = 0
         scores = []
         # Response categories, retrieve all tables
+        university_items = {}
+        faculty_items = {}
+        entry_num = 1
         for item_num, divs in enumerate(
             article.find_all("div", attrs={"class": "FrequencyBlock_HalfMain"})
         ):
-
             score_table = divs.find_all("table")[1].tbody.find_all(
                 "tr"
             )  # Split by stats and chart
-
+            
+            try:
+                caption = divs.find_all("table")[0].caption.text
+            except AttributeError:
+                caption = "Unknown"
+                
+            # Remove the preambles from the caption
+            match = re.search(r"Table for (.+?)-\d+\.\s*(.+)", caption)
+            if match:
+                caption = match.group(2)
+            else:
+                caption = "Unknown"
+            
+                # entry[f"{INDICATOR_PREFIX}{item_num+1}_label"] = match.group(1)
             # Extract the means and medians from their td element
-            mean, median = list(map(lambda x: x.find("td").text, score_table))[1:3]
-
+            temp = list(map(lambda x: x.find("td").text, score_table))[0:3]
+            mean, median = temp[1], temp[2]
+            
             # Attempt conversion, not sure if this activates...?
             try:
                 mean, median = float(mean), float(median)
-                entry[f"I{item_num+1}"] = [mean, median]
-                scores.append([mean, median])
             except ValueError:
-                print(f"score could not be converted: {code}, {mean}, {median}")
-
+                print(f"score could not be converted: {code}, mean: {mean} ({type(mean)}), median: {median} ({type(median)})")
+            finally:
+                entry_key = caption if use_labels else f"{INDICATOR_PREFIX}{item_num+1}"
+                
+                if results_as_dict:
+                    entry_data = {
+                        "mean": mean,
+                        "median": median,
+                        "indicator": caption,
+                    }
+                    if not include_labels:
+                        del entry_data["indicator"]
+                    if pd.isna(mean) or pd.isna(median) or pd.isna(caption):
+                        entry_data = {"mean": -1, "median": -1, "indicator": "error"}   
+                    # entry[entry_key] = entry_data
+                    
+                else:
+                    entry_data = [mean, median]
+                    
+                scores.append([mean, median])
+                
+                if entry_num <= 8:
+                    university_items[entry_key] = entry_data
+                else:
+                    faculty_items[entry_key] = entry_data
+                entry_num += 1
+                if exclude_faculty_items and entry_num > 8:
+                    break
+                
+        entry["university_items"] = university_items
+        if not exclude_faculty_items:
+            entry["faculty_items"] = faculty_items       
         entry["agg_score"] = [
             round(sum(map(lambda item: item[measure], scores)) / len(scores), 2)
             for measure in range(2)
@@ -96,12 +159,12 @@ def mine_setu_html(filename: str, season: str) -> dict:
 
         database[code] = entry
 
-    df = pd.DataFrame(database).T.fillna(0)
+    df = pd.DataFrame(database).T.infer_objects(copy=False)
     df = df.reset_index(drop=True)
 
-    columns_to_update = ["I9", "I10", "I11", "I12", "I13"]
-    df[columns_to_update] = df[columns_to_update].applymap(
-        lambda x: [0, 0] if x == 0 else x
+    columns_to_update = [col for col in df.columns if col.startswith(INDICATOR_PREFIX)]
+    df[columns_to_update] = df[columns_to_update].map(
+        lambda x: [-1, -1] if not isinstance(x, list) and pd.isna(x) else x
     )
 
     return df
@@ -122,13 +185,16 @@ if __name__ == "__main__":
 
             # Call mine_setu_html for the current file and season
             data = mine_setu_html(
-                filename=os.path.join(conversion_folder, filename), season=season
+                filename=os.path.join(conversion_folder, filename), season=season, results_as_dict=True, use_labels=True, exclude_faculty_items=True
             )
             json_filename = f'data_{season}.json'
             json_path = os.path.join(output_dir, json_filename)
-            
+            # TODO: come back to this :^)
+            if isinstance(data, pd.DataFrame):
+                data2 = data.to_dict(orient="records")
+
             with open(json_path, 'w') as f:
-                json.dump(data, f)  # Assuming data is a list directly
+                f.write(json.dumps(data2, indent=4))
 
             # Append the DataFrame to the list
             dfs.append(data)
